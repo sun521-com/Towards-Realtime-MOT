@@ -491,7 +491,7 @@ def fast_nms(boxes, scores, iou_thres:float=0.5, top_k:int=200, second_threshold
     keep = (iou_max <= iou_thres)
 
     if second_threshold:
-        keep *= (scores > self.conf_thresh)
+        keep *= (scores > conf_thres)
 
     return idx[keep]
 

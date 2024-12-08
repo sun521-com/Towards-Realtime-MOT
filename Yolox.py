@@ -5,6 +5,9 @@ import math
 import numpy as np
 from typing import Tuple, List
 
+import configparser
+from typing import Dict, Any
+
 
 def get_activation(name="silu", inplace=True):
     if name == "silu":
@@ -17,6 +20,38 @@ def get_activation(name="silu", inplace=True):
         raise AttributeError("Unsupported act type: {}".format(name))
     return module
 
+def parse_yolox_cfg(cfg_path: str) -> Dict[str, Any]:
+    """Parse YOLOX configuration file."""
+    config = configparser.ConfigParser()
+    config.read(cfg_path)
+
+    cfg_dict = {
+        # Network configuration
+        'width': config.getint('net', 'width', fallback=640),
+        'height': config.getint('net', 'height', fallback=640),
+        'embedding_dim': config.getint('net', 'embedding_dim', fallback=512),
+        'channels': config.getint('net', 'channels', fallback=3),
+        'depth': config.getfloat('net', 'depth', fallback=1.0),
+        'width_mul': config.getfloat('net', 'width_mul', fallback=1.0),
+
+        # Model configuration
+        'num_classes': config.getint('model', 'num_classes', fallback=1),
+        'strides': [int(x) for x in config.get('model', 'strides', fallback='8,16,32').split(',')],
+        'use_l1': config.getboolean('model', 'use_l1', fallback=False),
+        'use_reid': config.getboolean('model', 'use_reid', fallback=True),
+        'reid_dim': config.getint('model', 'reid_dim', fallback=512),
+
+        # Training configuration
+        'batch_size': config.getint('train', 'batch', fallback=16),
+        'subdivisions': config.getint('train', 'subdivisions', fallback=1),
+        'momentum': config.getfloat('train', 'momentum', fallback=0.9),
+        'weight_decay': config.getfloat('train', 'weight_decay', fallback=0.0005),
+        'ignore_thresh': config.getfloat('train', 'ignore_thresh', fallback=0.7),
+        'truth_thresh': config.getfloat('train', 'truth_thresh', fallback=1.0),
+        'random': config.getint('train', 'random', fallback=1),
+    }
+
+    return cfg_dict
 
 class BaseConv(nn.Module):
     """A Conv2d -> Batchnorm -> silu/leaky relu block"""
@@ -106,6 +141,31 @@ class CSPLayer(nn.Module):
         x_1 = self.m(x_1)
         x = torch.cat((x_1, x_2), dim=1)
         return self.conv3(x)
+
+
+class Bottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        shortcut=True,
+        expansion=0.5,
+        depthwise=False,
+        act="silu",
+    ):
+        super().__init__()
+        hidden_channels = int(out_channels * expansion)
+        Conv = DWConv if depthwise else BaseConv
+        self.conv1 = BaseConv(in_channels, hidden_channels, 1, stride=1, act=act)
+        self.conv2 = Conv(hidden_channels, out_channels, 3, stride=1, act=act)
+        self.use_add = shortcut and in_channels == out_channels
+
+    def forward(self, x):
+        y = self.conv2(self.conv1(x))
+        if self.use_add:
+            y = y + x
+        return y
 
 
 class SPPBottleneck(nn.Module):
@@ -206,46 +266,86 @@ class CSPDarknet(nn.Module):
         return {k: v for k, v in outputs.items() if k in self.out_features}
 
 
+import torch
+import torch.nn as nn
+from typing import Dict, Any
+
+
 class YOLOX(nn.Module):
     """
-    YOLOX model module. The module list is defined by create_yolov3_modules function.
-    The network returns loss values from three YOLO layers during training
-    and detection results during test.
+    YOLOX object detection model with ReID support
     """
 
-    def __init__(self, backbone=None, head=None, nID=0):
+    def __init__(self, cfg_dict: Dict[str, Any], nID: int = 0):
         super().__init__()
-        if backbone is None:
-            backbone = CSPDarknet(1.0, 1.0, nID=nID)
-        self.backbone = backbone
-        if head is None:
-            head = YOLOXHead(80)  # Default 80 COCO classes
-        self.head = head
+        self.cfg = cfg_dict
         self.nID = nID
 
+        # Initialize backbone
+        self.backbone = CSPDarknet(
+            dep_mul=self.cfg['depth'],
+            wid_mul=self.cfg['width_mul'],
+            out_features=("dark3", "dark4", "dark5"),
+            act="silu",
+            nID=nID if self.cfg['use_reid'] else 0
+        )
+
+        # Initialize detection head
+        self.head = YOLOXHead(
+            num_classes=self.cfg['num_classes'],
+            strides=self.cfg['strides'],
+            in_channels=[256, 512, 1024],
+            act="silu",
+            embedding_dim=self.cfg['reid_dim'] if self.cfg['use_reid'] else 0
+        )
+
+        # Initialize ReID classifier if needed
+        if self.cfg['use_reid'] and nID > 0:
+            self.reid_head = nn.Linear(self.cfg['reid_dim'], nID)
+            self.emb_scale = math.sqrt(2) * math.log(nID - 1) if nID > 1 else 1
+        else:
+            self.reid_head = None
+
+        # Training parameters
+        self.use_l1 = self.cfg['use_l1']
+
     def forward(self, x, targets=None):
-        # fpn output content features of [dark3, dark4, dark5]
+        # Get features from backbone
         fpn_outs = self.backbone(x)
 
         if self.training:
             assert targets is not None
-            loss, iou_loss, conf_loss, cls_loss, l1_loss, num_fg = self.head(
-                fpn_outs, targets, x
-            )
-            outputs = {
-                "total_loss": loss,
-                "iou_loss": iou_loss,
-                "l1_loss": l1_loss,
-                "conf_loss": conf_loss,
-                "cls_loss": cls_loss,
-                "num_fg": num_fg,
-            }
-            if self.nID > 0:
-                outputs["id_loss"] = self.backbone.IDLoss
+            outputs = self.head(fpn_outs, targets)
+
+            # Add ReID loss if needed
+            if self.reid_head is not None:
+                reid_features = outputs['reid_features']
+                if reid_features is not None:
+                    reid_features = self.emb_scale * F.normalize(reid_features, dim=1)
+                    outputs['reid_logits'] = self.reid_head(reid_features)
+
+            return outputs
         else:
             outputs = self.head(fpn_outs)
+            return outputs
 
-        return outputs
+    def load_config(self, cfg_path: str):
+        """Load configuration from file"""
+        new_cfg = parse_yolox_cfg(cfg_path)
+        self.cfg.update(new_cfg)
+
+    def get_model_info(self):
+        """Get model configuration info"""
+        info = {
+            'input_size': (self.cfg['height'], self.cfg['width']),
+            'num_classes': self.cfg['num_classes'],
+            'use_reid': self.cfg['use_reid'],
+            'reid_dim': self.cfg['reid_dim'],
+            'depth': self.cfg['depth'],
+            'width_mul': self.cfg['width_mul'],
+            'strides': self.cfg['strides']
+        }
+        return info
 
 
 class IOUloss(nn.Module):
