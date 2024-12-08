@@ -3,7 +3,7 @@ from collections import deque
 import torch
 from utils.kalman_filter import KalmanFilter
 from utils.log import logger
-from models import *
+from Yolov3 import *
 from tracker import matching
 from .basetrack import BaseTrack, TrackState
 

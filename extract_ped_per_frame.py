@@ -6,7 +6,7 @@ from pathlib import Path
 from sklearn import metrics
 from scipy import interpolate
 import torch.nn.functional as F
-from models import *
+from Yolov3 import *
 from utils.utils import *
 from torchvision.transforms import transforms as T
 from utils.datasets import LoadImages, JointDataset, collate_fn
