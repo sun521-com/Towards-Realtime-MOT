@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="deeplearningai" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="deeplearningai" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="bytetrack" project-jdk-type="Python SDK" />
 </project>
